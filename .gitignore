@@ -1,0 +1,46 @@
+# Environment
+.env
+venv/
+__pycache__/
+
+# Data files
+*.csv
+*.xml
+*.json
+!dataset/*.joblib
+
+# Shapefiles
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.sbn
+*.sbx
+*.zip
+
+# Images
+*.png
+*.jpg
+*.jpeg
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Model artifacts (keep joblib files in dataset/)
+*.pkl
+*.h5
+*.pt
+*.npy
+
+# Python files (only app.py is needed)
+*.py
+!app.py
