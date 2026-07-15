@@ -17,7 +17,13 @@ BUFFER_METERS = 100
 # ---------- Cached setup (runs once, not on every UI interaction) ----------
 @st.cache_resource
 def init_ee():
-    project_id = os.getenv("PROJECT_ID").strip()
+    # Cloud: read from Streamlit secrets; Local: read from .env
+    try:
+        project_id = st.secrets["PROJECT_ID"]
+    except (KeyError, FileNotFoundError):
+        project_id = os.getenv("PROJECT_ID")
+    if project_id:
+        project_id = project_id.strip()
     ee.Initialize(project=project_id)
     return True
 
