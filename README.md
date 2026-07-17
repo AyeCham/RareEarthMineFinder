@@ -34,7 +34,7 @@ A web application for detecting potential rare earth mining sites and monitoring
 
 ```bash
 # Clone the repository
-git clone https://github.com/AyeCham/SatelliteImageProcessor.git
+git clone https://github.com/yourusername/SatelliteImageProcessor.git
 cd SatelliteImageProcessor
 
 # Create virtual environment
