@@ -24,7 +24,18 @@ def init_ee():
         project_id = os.getenv("PROJECT_ID")
     if project_id:
         project_id = project_id.strip()
-    ee.Initialize(project=project_id)
+
+    # Try service account key first (Streamlit Cloud), fall back to default credentials
+    try:        
+        st.write("DEBUG secret keys:", list(st.secrets.keys()))
+        service_account_key = st.secrets["EARTH_ENGINE_SERVICE_ACCOUNT_KEY"]
+        import json
+        key_dict = json.loads(service_account_key)
+        credentials = ee.ServiceAccountCredentials(key_dict["client_email"], key_data=service_account_key)
+        ee.Initialize(credentials, project=project_id)
+    except (KeyError, FileNotFoundError):
+        ee.Initialize(project=project_id)
+
     return True
 
 @st.cache_resource
