@@ -27,7 +27,6 @@ def init_ee():
 
     # Try service account key first (Streamlit Cloud), fall back to default credentials
     try:        
-        st.write("DEBUG secret keys:", list(st.secrets.keys()))
         service_account_key = st.secrets["EARTH_ENGINE_SERVICE_ACCOUNT_KEY"]
         import json
         key_dict = json.loads(service_account_key)
