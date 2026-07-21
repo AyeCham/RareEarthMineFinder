@@ -227,6 +227,102 @@ def analyze_expansion(lat, lon, start_year=2016, end_year=None):
             'area_change_ha': round(change, 2), 'pct_change': round(pct, 1) if pct else None,
             'expanding': change > 0.5}
 
+# ---------- True-color before/after snapshots ----------
+def mask_landsat_clouds(image):
+    qa = image.select('QA_PIXEL')
+    cloud_bit = 1 << 3
+    shadow_bit = 1 << 4
+    mask = qa.bitwiseAnd(cloud_bit).eq(0).And(qa.bitwiseAnd(shadow_bit).eq(0))
+    return image.updateMask(mask)
+
+def mask_s2_clouds(image):
+    qa = image.select('QA60')
+    cloud_bit = 1 << 10
+    cirrus_bit = 1 << 11
+    mask = qa.bitwiseAnd(cloud_bit).eq(0).And(qa.bitwiseAnd(cirrus_bit).eq(0))
+    return image.updateMask(mask)
+
+def get_landsat_true_color(region, start, end):
+    """Harmonized L5/L7/L8/L9 true-color composite, properly scaled to reflectance."""
+    def scale_landsat(img):
+        return img.multiply(0.0000275).add(-0.2)
+
+    def prep(collection, bands):
+        return (collection
+                .filterBounds(region).filterDate(start, end)
+                .filter(ee.Filter.calendarRange(1, 3, 'month'))
+                .map(mask_landsat_clouds)
+                .map(lambda img: scale_landsat(img.select(bands, ['BLUE', 'GREEN', 'RED']))))
+
+    l5 = prep(ee.ImageCollection('LANDSAT/LT05/C02/T1_L2'), ['SR_B1', 'SR_B2', 'SR_B3'])
+    l7 = prep(ee.ImageCollection('LANDSAT/LE07/C02/T1_L2'), ['SR_B1', 'SR_B2', 'SR_B3'])
+    l8 = prep(ee.ImageCollection('LANDSAT/LC08/C02/T1_L2'), ['SR_B2', 'SR_B3', 'SR_B4'])
+    l9 = prep(ee.ImageCollection('LANDSAT/LC09/C02/T1_L2'), ['SR_B2', 'SR_B3', 'SR_B4'])
+
+    merged = l5.merge(l7).merge(l8).merge(l9)
+    return merged.median().clip(region), merged.size()
+
+def get_sentinel2_true_color(region, start, end):
+    """Sentinel-2 true-color composite, scaled to reflectance."""
+    col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+           .filterBounds(region).filterDate(start, end)
+           .filter(ee.Filter.calendarRange(1, 3, 'month'))
+           .map(mask_s2_clouds)
+           .map(lambda img: img.select(['B4', 'B3', 'B2'], ['RED', 'GREEN', 'BLUE']).divide(10000)))
+    return col.median().clip(region), col.size()
+
+def get_site_snapshots(lat, lon, before_year, after_year, radius_m=500):
+    """Return (before_url, after_url) true-color thumbnail URLs for a site.
+    Before uses Landsat (better historical coverage); after uses Sentinel-2 (higher resolution)."""
+    region = ee.Geometry.Point([lon, lat]).buffer(radius_m).bounds()
+
+    before_start = ee.Date.fromYMD(before_year, 1, 1)
+    before_end = ee.Date.fromYMD(before_year, 3, 31)
+    after_start = ee.Date.fromYMD(after_year, 1, 1)
+    after_end = ee.Date.fromYMD(after_year, 3, 31)
+
+    before_img, before_count = get_landsat_true_color(region, before_start, before_end)
+    after_img, after_count = get_sentinel2_true_color(region, after_start, after_end)
+
+    thumb_params = {'region': region, 'dimensions': 400, 'format': 'png',
+                     'bands': ['RED', 'GREEN', 'BLUE'], 'min': 0, 'max': 0.3}
+
+    before_url, after_url = None, None
+    try:
+        if before_count.getInfo() > 0:
+            before_url = before_img.getThumbURL(thumb_params)
+    except Exception:
+        before_url = None
+    try:
+        if after_count.getInfo() > 0:
+            after_url = after_img.getThumbURL(thumb_params)
+    except Exception:
+        after_url = None
+
+    return before_url, after_url
+
+def render_site_snapshots(snapshots, report_df):
+    """Display before/after image pairs for each analyzed site."""
+    if not snapshots:
+        return
+    st.subheader("Before / After satellite snapshots")
+    for i, snap in enumerate(snapshots):
+        label = f"Site {i + 1} — ({snap['lat']:.5f}, {snap['lon']:.5f})"
+        with st.expander(label, expanded=(i == 0)):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.caption(f"Before ({snap['before_year']})")
+                if snap['before_url']:
+                    st.image(snap['before_url'])
+                else:
+                    st.info("No cloud-free imagery available for this year.")
+            with c2:
+                st.caption(f"After ({snap['after_year']})")
+                if snap['after_url']:
+                    st.image(snap['after_url'])
+                else:
+                    st.info("No cloud-free imagery available for this year.")
+
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title="Rare Earth Mine Monitor", layout="wide")
 st.title("Rare Earth Mine Detection & Expansion Monitor")
@@ -317,7 +413,16 @@ if 'coord_result' in st.session_state:
         sites = result['sites']
         st.warning(f"Found {len(sites)} candidate site(s) within {result['radius_km']}km")
 
-        m = folium.Map(location=[result['lat'], result['lon']], zoom_start=13)
+        m = folium.Map(location=[result['lat'], result['lon']], zoom_start=13, tiles=None)
+        folium.TileLayer(
+            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            attr='Esri, Maxar, Earthstar Geographics',
+            name='Satellite',
+            overlay=False,
+            control=True
+        ).add_to(m)
+        folium.TileLayer('OpenStreetMap', name='Streets', overlay=False, control=True).add_to(m)
+        folium.LayerControl().add_to(m)
         folium.Marker([result['lat'], result['lon']], icon=folium.Icon(color='blue'),
                       popup="Your search point").add_to(m)
         folium.Circle([result['lat'], result['lon']], radius=result['radius_km'] * 1000,
@@ -336,19 +441,28 @@ if 'coord_result' in st.session_state:
 
         if st.button("Run expansion analysis on detected site(s)"):
             results = []
+            snapshots = []
+            end_year = get_latest_year()
             progress = st.progress(0.0)
             for i, (_, row) in enumerate(sites.iterrows()):
-                expansion = analyze_expansion(row['lat'], row['lon'], start_year=baseline_year)
+                expansion = analyze_expansion(row['lat'], row['lon'], start_year=baseline_year, end_year=end_year)
                 results.append({
                     'lat': row['lat'], 'lon': row['lon'],
                     'mine_probability': row['mine_probability'],
                     **expansion
+                })
+                before_url, after_url = get_site_snapshots(row['lat'], row['lon'], baseline_year, end_year)
+                snapshots.append({
+                    'lat': row['lat'], 'lon': row['lon'],
+                    'before_year': baseline_year, 'after_year': end_year,
+                    'before_url': before_url, 'after_url': after_url
                 })
                 progress.progress((i + 1) / len(sites))
             progress.empty()
 
             report_df = pd.DataFrame(results)
             st.session_state['coord_report'] = report_df
+            st.session_state['coord_snapshots'] = snapshots
 
         if 'coord_report' in st.session_state:
             report_df = st.session_state['coord_report']
@@ -357,6 +471,7 @@ if 'coord_result' in st.session_state:
             st.download_button("Download this report as CSV", csv,
                                f"impact_report_{result['lat']}_{result['lon']}.csv", "text/csv",
                                key="coord_download")
+            render_site_snapshots(st.session_state.get('coord_snapshots', []), report_df)
 
 
 
@@ -382,20 +497,29 @@ if 'sites' in st.session_state:
 
     if st.button("Run expansion analysis on candidate sites"):
         results = []
+        snapshots = []
+        end_year = get_latest_year()
         progress = st.progress(0.0)
         top_sites = sites.sort_values('mine_probability', ascending=False).head(max_sites)
 
         for i, (_, row) in enumerate(top_sites.iterrows()):
-            expansion = analyze_expansion(row['lat'], row['lon'], start_year=start_year)
+            expansion = analyze_expansion(row['lat'], row['lon'], start_year=start_year, end_year=end_year)
             results.append({
                 'lat': row['lat'], 'lon': row['lon'],
                 'mine_probability': row['mine_probability'],
                 **expansion
             })
+            before_url, after_url = get_site_snapshots(row['lat'], row['lon'], start_year, end_year)
+            snapshots.append({
+                'lat': row['lat'], 'lon': row['lon'],
+                'before_year': start_year, 'after_year': end_year,
+                'before_url': before_url, 'after_url': after_url
+            })
             progress.progress((i + 1) / len(top_sites))
 
         report_df = pd.DataFrame(results)
         st.session_state['report'] = report_df
+        st.session_state['report_snapshots'] = snapshots
         progress.empty()
 
 if 'report' in st.session_state:
@@ -408,3 +532,5 @@ if 'report' in st.session_state:
 
     csv = report_df.to_csv(index=False).encode('utf-8')
     st.download_button("Download report as CSV", csv, "environmental_impact_report.csv", "text/csv")
+
+    render_site_snapshots(st.session_state.get('report_snapshots', []), report_df)
