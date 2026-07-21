@@ -437,7 +437,7 @@ if 'coord_result' in st.session_state:
         st.dataframe(sites.sort_values('mine_probability', ascending=False))
 
         st.subheader("Environmental impact for detected site(s)")
-        baseline_year = st.number_input("Baseline year for comparison", min_value=2016, max_value=2026, value=2016, key="coord_baseline")
+        baseline_year = st.number_input("Baseline year for comparison", max_value=2026, value=2016, key="coord_baseline")
 
         if st.button("Run expansion analysis on detected site(s)"):
             results = []
@@ -492,7 +492,7 @@ if 'sites' in st.session_state:
 
     st.subheader("Environmental impact analysis")
     col1, col2 = st.columns(2)
-    start_year = col1.number_input("Baseline year", min_value=2016, max_value=2026, value=2016)
+    start_year = col1.number_input("Baseline year", max_value=2026, value=2016)
     max_sites = col2.number_input("Max sites to analyze (limits runtime)", min_value=1, max_value=len(sites), value=min(10, len(sites)))
 
     if st.button("Run expansion analysis on candidate sites"):
