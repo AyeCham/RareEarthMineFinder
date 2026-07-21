@@ -167,8 +167,72 @@ NDVI_THRESHOLD = 0.3
 SITE_RADIUS_M = 500
 EXPANSION_YEARS = list(range(2016, 2027))
 
+SENTINEL2_SR_START_YEAR = 2017  # COPERNICUS/S2_SR_HARMONIZED has no usable coverage before this
+
+def get_landsat_ndvi_collection(region, start, end):
+    """Harmonized L5/L7/L8/L9 collection with RED/NIR bands, scaled to reflectance."""
+    def scale_landsat(img):
+        return img.multiply(0.0000275).add(-0.2)
+
+    def prep(collection, bands):
+        return (collection
+                .filterBounds(region).filterDate(start, end)
+                .map(mask_landsat_clouds)
+                .map(lambda img: scale_landsat(img.select(bands, ['RED', 'NIR']))))
+
+    l5 = prep(ee.ImageCollection('LANDSAT/LT05/C02/T1_L2'), ['SR_B3', 'SR_B4'])
+    l7 = prep(ee.ImageCollection('LANDSAT/LE07/C02/T1_L2'), ['SR_B3', 'SR_B4'])
+    l8 = prep(ee.ImageCollection('LANDSAT/LC08/C02/T1_L2'), ['SR_B4', 'SR_B5'])
+    l9 = prep(ee.ImageCollection('LANDSAT/LC09/C02/T1_L2'), ['SR_B4', 'SR_B5'])
+    return l5.merge(l7).merge(l8).merge(l9)
+
+def compute_ndvi_stats_landsat(lat, lon, year):
+    """Landsat-based NDVI stats (30m). Used as a fallback for years before Sentinel-2 SR
+    coverage (pre-2017), or whenever Sentinel-2 has no cloud-free imagery for the year."""
+    point = ee.Geometry.Point([lon, lat])
+    region = point.buffer(SITE_RADIUS_M).bounds()
+
+    start = f"{year}-01-01"
+    end = f"{year}-12-31"
+
+    collection = get_landsat_ndvi_collection(region, start, end)
+    count = collection.size()
+    if count.getInfo() == 0:
+        return None
+
+    image = collection.median()
+    ndvi = image.normalizedDifference(["NIR", "RED"]).rename("NDVI")
+    disturbed = ndvi.lt(NDVI_THRESHOLD).rename("NDVI")
+
+    # Landsat pixels are 30m -> 900 sq m -> 0.09 ha per pixel
+    result = ee.Dictionary({
+        "ndvi_mean": ndvi.reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=region, scale=30, maxPixels=1e8
+        ).get("NDVI"),
+        "ndvi_std": ndvi.reduceRegion(
+            reducer=ee.Reducer.stdDev(), geometry=region, scale=30, maxPixels=1e8
+        ).get("NDVI"),
+        "disturbed_ha": ee.Number(disturbed.reduceRegion(
+            reducer=ee.Reducer.sum(), geometry=region, scale=30, maxPixels=1e8
+        ).get("NDVI")).multiply(0.09),
+        "total_ha": ee.Number(disturbed.reduceRegion(
+            reducer=ee.Reducer.count(), geometry=region, scale=30, maxPixels=1e8
+        ).get("NDVI")).multiply(0.09),
+        "image_count": count,
+    }).getInfo()
+
+    if result.get("ndvi_mean") is None:
+        return None
+    result["source"] = "landsat"
+    return result
+
 def compute_ndvi_stats(lat, lon, year):
-    """Compute NDVI statistics for a site in a given year (matches export_expansion.py)."""
+    """Compute NDVI statistics for a site in a given year. Prefers Sentinel-2 (matches
+    export_expansion.py); falls back to Landsat for years before Sentinel-2 SR coverage
+    (pre-2017) or whenever Sentinel-2 has no cloud-free imagery for that year."""
+    if year < SENTINEL2_SR_START_YEAR:
+        return compute_ndvi_stats_landsat(lat, lon, year)
+
     point = ee.Geometry.Point([lon, lat])
     region = point.buffer(SITE_RADIUS_M).bounds()
 
@@ -184,7 +248,7 @@ def compute_ndvi_stats(lat, lon, year):
 
     count = collection.size()
     if count.getInfo() == 0:
-        return None
+        return compute_ndvi_stats_landsat(lat, lon, year)
 
     image = collection.median()
     ndvi = image.normalizedDifference(["B8", "B4"]).rename("NDVI")
@@ -207,25 +271,30 @@ def compute_ndvi_stats(lat, lon, year):
     }).getInfo()
 
     if result.get("ndvi_mean") is None:
-        return None
+        return compute_ndvi_stats_landsat(lat, lon, year)
+    result["source"] = "sentinel2"
     return result
 
 def analyze_expansion(lat, lon, start_year=2016, end_year=None):
-    """Compare disturbed area (NDVI < 0.3) between start and end year using Sentinel-2."""
+    """Compare disturbed area (NDVI < 0.3) between start and end year.
+    Uses Sentinel-2 where available (2017+), falling back to Landsat otherwise."""
     if end_year is None:
         end_year = get_latest_year()
     start_stats = compute_ndvi_stats(lat, lon, start_year)
     end_stats = compute_ndvi_stats(lat, lon, end_year)
     if start_stats is None or end_stats is None:
         return {'bare_area_start_ha': None, 'bare_area_end_ha': None,
-                'area_change_ha': None, 'pct_change': None, 'expanding': 'no_data'}
+                'area_change_ha': None, 'pct_change': None, 'expanding': 'no_data',
+                'start_source': start_stats.get('source') if start_stats else None,
+                'end_source': end_stats.get('source') if end_stats else None}
     start_area = start_stats['disturbed_ha']
     end_area = end_stats['disturbed_ha']
     change = end_area - start_area
     pct = (change / start_area * 100) if start_area > 0 else None
     return {'bare_area_start_ha': round(start_area, 2), 'bare_area_end_ha': round(end_area, 2),
             'area_change_ha': round(change, 2), 'pct_change': round(pct, 1) if pct else None,
-            'expanding': change > 0.5}
+            'expanding': change > 0.5,
+            'start_source': start_stats.get('source'), 'end_source': end_stats.get('source')}
 
 # ---------- True-color before/after snapshots ----------
 def mask_landsat_clouds(image):
@@ -438,6 +507,9 @@ if 'coord_result' in st.session_state:
 
         st.subheader("Environmental impact for detected site(s)")
         baseline_year = st.number_input("Baseline year for comparison", max_value=2026, value=2016, key="coord_baseline")
+        if baseline_year < SENTINEL2_SR_START_YEAR:
+            st.caption(f"ℹ️ Sentinel-2 imagery isn't available before {SENTINEL2_SR_START_YEAR}. "
+                       f"NDVI analysis for {baseline_year} will automatically use Landsat instead (30m resolution, slightly less precise).")
 
         if st.button("Run expansion analysis on detected site(s)"):
             results = []
@@ -494,6 +566,9 @@ if 'sites' in st.session_state:
     col1, col2 = st.columns(2)
     start_year = col1.number_input("Baseline year", max_value=2026, value=2016)
     max_sites = col2.number_input("Max sites to analyze (limits runtime)", min_value=1, max_value=len(sites), value=min(10, len(sites)))
+    if start_year < SENTINEL2_SR_START_YEAR:
+        st.caption(f"ℹ️ Sentinel-2 imagery isn't available before {SENTINEL2_SR_START_YEAR}. "
+                   f"NDVI analysis for {start_year} will automatically use Landsat instead (30m resolution, slightly less precise).")
 
     if st.button("Run expansion analysis on candidate sites"):
         results = []
